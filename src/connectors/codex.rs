@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,12 @@ const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 enum FileScanMetadata {
     Process(Option<fs::Metadata>),
     Skip,
+}
+
+#[derive(Default)]
+struct CodexTitleSources {
+    session_index: HashMap<String, String>,
+    history: HashMap<String, String>,
 }
 
 impl Default for CodexConnector {
@@ -95,6 +101,194 @@ impl CodexConnector {
                 ancestor.file_name().and_then(|name| name.to_str()) == Some("sessions")
             })
             .map(Path::to_path_buf)
+    }
+
+    fn codex_home_for_title_sidecars(root: &Path, explicit_file: Option<&Path>) -> PathBuf {
+        if let Some(sessions_dir) = explicit_file.and_then(Self::sessions_dir_for_explicit_file)
+            && let Some(home) = sessions_dir.parent()
+        {
+            return home.to_path_buf();
+        }
+
+        if root.file_name().and_then(|name| name.to_str()) == Some("sessions")
+            && let Some(home) = root.parent()
+        {
+            return home.to_path_buf();
+        }
+
+        if root.join("session_index.jsonl").exists()
+            || root.join("history.jsonl").exists()
+            || root.join("sessions").exists()
+        {
+            return root.to_path_buf();
+        }
+
+        let nested_codex = root.join(".codex");
+        if nested_codex.exists() {
+            return nested_codex;
+        }
+
+        root.to_path_buf()
+    }
+
+    fn load_title_sources(home: &Path) -> CodexTitleSources {
+        CodexTitleSources {
+            session_index: Self::load_session_index_titles(&home.join("session_index.jsonl")),
+            history: Self::load_history_titles(&home.join("history.jsonl")),
+        }
+    }
+
+    fn load_session_index_titles(path: &Path) -> HashMap<String, String> {
+        let mut titles = HashMap::new();
+        let Ok(content) = fs::read_to_string(path) else {
+            return titles;
+        };
+
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(session_id) = Self::string_field(&value, &["id"]) else {
+                continue;
+            };
+            if let Some(title) = Self::title_from_fields(&value) {
+                titles.insert(session_id, title);
+            }
+        }
+
+        titles
+    }
+
+    fn load_history_titles(path: &Path) -> HashMap<String, String> {
+        let mut candidates: HashMap<String, (i64, String)> = HashMap::new();
+        let Ok(content) = fs::read_to_string(path) else {
+            return HashMap::new();
+        };
+
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(session_id) = Self::string_field(&value, &["session_id"]) else {
+                continue;
+            };
+            let Some(title) = value
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(Self::title_from_text)
+            else {
+                continue;
+            };
+            let ts = value.get("ts").and_then(Value::as_i64).unwrap_or(i64::MAX);
+            match candidates.get_mut(&session_id) {
+                Some((current_ts, current_title)) if ts < *current_ts => {
+                    *current_ts = ts;
+                    *current_title = title;
+                }
+                None => {
+                    candidates.insert(session_id, (ts, title));
+                }
+                _ => {}
+            }
+        }
+
+        candidates
+            .into_iter()
+            .map(|(session_id, (_, title))| (session_id, title))
+            .collect()
+    }
+
+    fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+        keys.iter().find_map(|key| {
+            value
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|candidate| !candidate.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    fn title_from_fields(value: &Value) -> Option<String> {
+        ["thread_name", "title", "name"].iter().find_map(|key| {
+            value
+                .get(*key)
+                .and_then(Value::as_str)
+                .and_then(Self::title_from_text)
+        })
+    }
+
+    fn title_from_text(text: &str) -> Option<String> {
+        text.lines()
+            .map(str::trim)
+            .find(|line| Self::is_substantive_title_line(line))
+            .map(|line| line.chars().take(100).collect())
+    }
+
+    fn is_substantive_title_line(line: &str) -> bool {
+        if line.is_empty() {
+            return false;
+        }
+
+        let lower = line.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "<user_instructions>" | "<environment_context>"
+        ) {
+            return false;
+        }
+
+        !Self::is_tag_only_title_line(line)
+    }
+
+    fn is_tag_only_title_line(line: &str) -> bool {
+        let Some(inner) = line
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+        else {
+            return false;
+        };
+        !inner.is_empty()
+            && inner
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '/'))
+    }
+
+    fn resolve_title(
+        explicit_title: Option<String>,
+        session_id: Option<&str>,
+        title_sources: &CodexTitleSources,
+        messages: &[NormalizedMessage],
+    ) -> (Option<String>, &'static str) {
+        if let Some(title) = explicit_title {
+            return (Some(title), "session_metadata");
+        }
+
+        if let Some(session_id) = session_id {
+            if let Some(title) = title_sources.session_index.get(session_id) {
+                return (Some(title.clone()), "session_index");
+            }
+            if let Some(title) = title_sources.history.get(session_id) {
+                return (Some(title.clone()), "history");
+            }
+        }
+
+        if let Some(title) = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .find_map(|message| Self::title_from_text(&message.content))
+        {
+            return (Some(title), "first_user_message");
+        }
+
+        if let Some(title) = messages
+            .iter()
+            .find_map(|message| Self::title_from_text(&message.content))
+        {
+            return (Some(title), "first_message");
+        }
+
+        (None, "none")
     }
 
     fn rollout_files(root: &Path) -> Vec<PathBuf> {
@@ -379,6 +573,9 @@ fn scan_codex_with_callback(
             .as_ref()
             .and_then(|path| CodexConnector::sessions_dir_for_explicit_file(path))
             .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
+        let title_home =
+            CodexConnector::codex_home_for_title_sidecars(&root, explicit_file.as_deref());
+        let title_sources = CodexConnector::load_title_sources(&title_home);
 
         for file in files {
             if !seen_files.insert(dedupe_path_key(&file)) {
@@ -419,6 +616,8 @@ fn scan_codex_with_callback(
             let mut started_at = None;
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
+            let mut session_id: Option<String> = None;
+            let mut explicit_title: Option<String> = None;
 
             if ext == Some("jsonl") {
                 let f = std::fs::File::open(&file)
@@ -442,6 +641,15 @@ fn scan_codex_with_callback(
                     match entry_type {
                         "session_meta" => {
                             if let Some(payload) = val.get("payload") {
+                                if session_id.is_none() {
+                                    session_id = CodexConnector::string_field(
+                                        payload,
+                                        &["id", "session_id"],
+                                    );
+                                }
+                                if explicit_title.is_none() {
+                                    explicit_title = CodexConnector::title_from_fields(payload);
+                                }
                                 session_cwd = payload
                                     .get("cwd")
                                     .and_then(|v| v.as_str())
@@ -620,6 +828,17 @@ fn scan_codex_with_callback(
                     Err(_) => continue,
                 };
 
+                if let Some(session) = val.get("session") {
+                    session_id = CodexConnector::string_field(session, &["id", "session_id"]);
+                    explicit_title = CodexConnector::title_from_fields(session);
+                }
+                if session_id.is_none() {
+                    session_id = CodexConnector::string_field(&val, &["id", "session_id"]);
+                }
+                if explicit_title.is_none() {
+                    explicit_title = CodexConnector::title_from_fields(&val);
+                }
+
                 session_cwd = val
                     .get("session")
                     .and_then(|s| s.get("cwd"))
@@ -664,24 +883,13 @@ fn scan_codex_with_callback(
                 continue;
             }
 
-            let title = messages
-                .iter()
-                .find(|m| m.role == "user")
-                .map(|m| {
-                    m.content
-                        .lines()
-                        .next()
-                        .unwrap_or(&m.content)
-                        .chars()
-                        .take(100)
-                        .collect::<String>()
-                })
-                .or_else(|| {
-                    messages
-                        .first()
-                        .and_then(|m| m.content.lines().next())
-                        .map(|s| s.chars().take(100).collect())
-                });
+            let session_id_for_metadata = session_id.clone();
+            let (title, title_source) = CodexConnector::resolve_title(
+                explicit_title,
+                session_id.as_deref(),
+                &title_sources,
+                &messages,
+            );
 
             on_conversation(NormalizedConversation {
                 agent_slug: "codex".to_string(),
@@ -691,7 +899,11 @@ fn scan_codex_with_callback(
                 source_path: source_path.clone(),
                 started_at,
                 ended_at,
-                metadata: serde_json::json!({"source": if ext == Some("json") { "rollout_json" } else { "rollout" }}),
+                metadata: serde_json::json!({
+                    "source": if ext == Some("json") { "rollout_json" } else { "rollout" },
+                    "session_id": session_id_for_metadata,
+                    "title_source": title_source,
+                }),
                 messages,
             })?;
         }
@@ -1622,6 +1834,122 @@ not valid json at all
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("Assistant speaks first".to_string()));
+    }
+
+    #[test]
+    fn scan_uses_embedded_session_title_before_messages() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"session_meta","payload":{"id":"session-embedded","title":"Embedded Thread Title"}}
+{"type":"response_item","payload":{"role":"user","content":"<user_instructions>"}}
+{"type":"response_item","payload":{"role":"user","content":"Real prompt"}}
+"#;
+        fs::write(sessions.join("rollout-embedded-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, Some("Embedded Thread Title".to_string()));
+        assert_eq!(convs[0].metadata["session_id"], "session-embedded");
+        assert_eq!(convs[0].metadata["title_source"], "session_metadata");
+    }
+
+    #[test]
+    fn scan_uses_session_index_thread_name_before_bootstrap_message() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            codex_dir.join("session_index.jsonl"),
+            r#"{"id":"session-indexed","thread_name":"Indexed Thread Title","updated_at":1}"#,
+        )
+        .unwrap();
+
+        let content = r#"{"type":"session_meta","payload":{"id":"session-indexed"}}
+{"type":"response_item","payload":{"role":"user","content":"<user_instructions>"}}
+{"type":"response_item","payload":{"role":"user","content":"Real prompt"}}
+"#;
+        fs::write(sessions.join("rollout-indexed-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, Some("Indexed Thread Title".to_string()));
+        assert_eq!(convs[0].messages[0].content, "<user_instructions>");
+        assert_eq!(convs[0].metadata["title_source"], "session_index");
+    }
+
+    #[test]
+    fn scan_uses_history_prompt_when_session_index_missing() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let history = r#"{"session_id":"session-history","ts":20,"text":"Later prompt"}
+{"session_id":"session-history","ts":10,"text":"First real prompt from history\nMore detail"}
+"#;
+        fs::write(codex_dir.join("history.jsonl"), history).unwrap();
+
+        let content = r#"{"type":"session_meta","payload":{"id":"session-history"}}
+{"type":"response_item","payload":{"role":"user","content":"<user_instructions>"}}
+"#;
+        fs::write(sessions.join("rollout-history-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs[0].title,
+            Some("First real prompt from history".to_string())
+        );
+        assert_eq!(convs[0].metadata["title_source"], "history");
+    }
+
+    #[test]
+    fn scan_skips_environment_context_for_message_title() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","payload":{"role":"user","content":"<environment_context>"}}
+{"type":"response_item","payload":{"role":"user","content":"Actual request title"}}
+"#;
+        fs::write(sessions.join("rollout-skip-environment.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, Some("Actual request title".to_string()));
+        assert_eq!(convs[0].metadata["title_source"], "first_user_message");
+    }
+
+    #[test]
+    fn scan_returns_no_title_when_only_wrapper_candidates() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","payload":{"role":"user","content":"<user_instructions>"}}
+{"type":"response_item","payload":{"role":"assistant","content":"<environment_context>"}}
+"#;
+        fs::write(sessions.join("rollout-wrapper-only.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, None);
+        assert_eq!(convs[0].metadata["title_source"], "none");
     }
 
     // =====================================================
