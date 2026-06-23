@@ -19,6 +19,8 @@ use crate::types::{
 
 pub struct CodexConnector;
 
+const TITLE_MAX_CHARS: usize = 100;
+const TITLE_TRUNCATION_SUFFIX: &str = "...";
 const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 
 enum FileScanMetadata {
@@ -309,7 +311,18 @@ impl CodexConnector {
         text.lines()
             .map(str::trim)
             .find(|line| Self::is_substantive_title_line(line))
-            .map(|line| line.chars().take(100).collect())
+            .map(Self::truncate_title)
+    }
+
+    fn truncate_title(title: &str) -> String {
+        if title.chars().count() <= TITLE_MAX_CHARS {
+            return title.to_string();
+        }
+
+        let prefix_chars = TITLE_MAX_CHARS.saturating_sub(TITLE_TRUNCATION_SUFFIX.len());
+        let mut truncated: String = title.chars().take(prefix_chars).collect();
+        truncated.push_str(TITLE_TRUNCATION_SUFFIX);
+        truncated
     }
 
     fn is_substantive_title_line(line: &str) -> bool {
@@ -1932,6 +1945,7 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
+        assert_eq!(convs[0].title, Some(format!("{}...", "x".repeat(97))));
         assert_eq!(convs[0].title.as_ref().unwrap().len(), 100);
     }
 
