@@ -325,7 +325,7 @@ impl CodexConnector {
             return false;
         }
 
-        !Self::is_tag_only_title_line(line)
+        !Self::is_tag_only_title_line(line) && !Self::is_known_bootstrap_element_line(line)
     }
 
     fn is_tag_only_title_line(line: &str) -> bool {
@@ -339,6 +339,46 @@ impl CodexConnector {
             && inner
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '/'))
+    }
+
+    fn is_known_bootstrap_element_line(line: &str) -> bool {
+        let Some((tag, _)) = Self::xml_like_element_parts(line) else {
+            return false;
+        };
+
+        matches!(
+            tag,
+            "approval_policy"
+                | "current_date"
+                | "cwd"
+                | "filesystem"
+                | "network_access"
+                | "permission_profile"
+                | "root"
+                | "sandbox_mode"
+                | "shell"
+                | "timezone"
+                | "workspace_roots"
+        )
+    }
+
+    fn xml_like_element_parts(line: &str) -> Option<(&str, &str)> {
+        let rest = line.strip_prefix('<')?;
+        let tag_end = rest.find('>')?;
+        let tag = &rest[..tag_end];
+        if tag.is_empty()
+            || tag.starts_with('/')
+            || !tag
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':'))
+        {
+            return None;
+        }
+
+        let content = &rest[tag_end + 1..];
+        let close = format!("</{tag}>");
+        let inner = content.strip_suffix(&close)?;
+        Some((tag, inner))
     }
 
     fn resolve_title(
@@ -2049,6 +2089,39 @@ not valid json at all
     }
 
     #[test]
+    fn scan_skips_bootstrap_state_db_title_and_falls_back() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            codex_dir.join("session_index.jsonl"),
+            r#"{"id":"session-cwd-state","thread_name":"Indexed Fallback Title","updated_at":1}"#,
+        )
+        .unwrap();
+
+        let conn = open_test_connection(&codex_dir.join("state_5.sqlite"));
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+             INSERT INTO threads (id, title) VALUES ('session-cwd-state', '<cwd>/Users/example/project</cwd>');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let content = r#"{"type":"session_meta","payload":{"id":"session-cwd-state"}}
+{"type":"response_item","payload":{"role":"user","content":"Real prompt"}}
+"#;
+        fs::write(sessions.join("rollout-cwd-state-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, Some("Indexed Fallback Title".to_string()));
+        assert_eq!(convs[0].metadata["title_source"], "session_index");
+    }
+
+    #[test]
     fn scan_uses_history_prompt_when_session_index_missing() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
@@ -2086,6 +2159,26 @@ not valid json at all
 {"type":"response_item","payload":{"role":"user","content":"Actual request title"}}
 "#;
         fs::write(sessions.join("rollout-skip-environment.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, Some("Actual request title".to_string()));
+        assert_eq!(convs[0].metadata["title_source"], "first_user_message");
+    }
+
+    #[test]
+    fn scan_skips_known_bootstrap_xml_elements_for_message_title() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","payload":{"role":"user","content":"<cwd>/Users/example/project</cwd>"}}
+{"type":"response_item","payload":{"role":"user","content":"Actual request title"}}
+"#;
+        fs::write(sessions.join("rollout-skip-cwd-element.jsonl"), content).unwrap();
 
         let connector = CodexConnector::new();
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
