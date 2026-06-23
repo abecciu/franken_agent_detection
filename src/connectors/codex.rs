@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
+use frankensqlite::params;
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -27,6 +29,7 @@ enum FileScanMetadata {
 
 #[derive(Default)]
 struct CodexTitleSources {
+    state_db: HashMap<String, String>,
     session_index: HashMap<String, String>,
     history: HashMap<String, String>,
 }
@@ -118,6 +121,8 @@ impl CodexConnector {
 
         if root.join("session_index.jsonl").exists()
             || root.join("history.jsonl").exists()
+            || root.join("state_5.sqlite").exists()
+            || root.join("sqlite").join("state_5.sqlite").exists()
             || root.join("sessions").exists()
         {
             return root.to_path_buf();
@@ -133,9 +138,92 @@ impl CodexConnector {
 
     fn load_title_sources(home: &Path) -> CodexTitleSources {
         CodexTitleSources {
+            state_db: Self::load_state_db_titles(home),
             session_index: Self::load_session_index_titles(&home.join("session_index.jsonl")),
             history: Self::load_history_titles(&home.join("history.jsonl")),
         }
+    }
+
+    fn load_state_db_titles(home: &Path) -> HashMap<String, String> {
+        let mut titles = HashMap::new();
+        for path in Self::state_db_candidates(home) {
+            if let Err(err) = Self::merge_state_db_titles(&path, &mut titles) {
+                tracing::debug!("codex state db: failed to read {}: {err}", path.display());
+            }
+        }
+        titles
+    }
+
+    fn state_db_candidates(home: &Path) -> Vec<PathBuf> {
+        let mut candidates: Vec<(u64, u8, PathBuf)> = Vec::new();
+        for (precedence, dir) in [(0, home.join("sqlite")), (1, home.to_path_buf())] {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(version) = Self::state_db_version(&path) else {
+                    continue;
+                };
+                candidates.push((version, precedence, path));
+            }
+        }
+
+        candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+
+        let mut seen = HashSet::new();
+        candidates
+            .into_iter()
+            .filter_map(|(_, _, path)| {
+                if seen.insert(dedupe_path_key(&path)) {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn state_db_version(path: &Path) -> Option<u64> {
+        let name = path.file_name().and_then(|name| name.to_str())?;
+        let version = name
+            .strip_prefix("state_")
+            .and_then(|value| value.strip_suffix(".sqlite"))?
+            .parse()
+            .ok()?;
+        Some(version)
+    }
+
+    fn merge_state_db_titles(path: &Path, titles: &mut HashMap<String, String>) -> Result<()> {
+        let conn = open_with_flags(
+            path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .with_context(|| format!("failed to open Codex state db: {}", path.display()))?;
+
+        conn.execute("PRAGMA busy_timeout = 5000;")
+            .with_context(|| "failed to set busy_timeout")?;
+
+        let rows: Vec<(String, String)> = conn
+            .query_map_collect(
+                "SELECT id, title FROM threads WHERE title IS NOT NULL AND title <> ''",
+                params![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .with_context(|| "failed to query Codex state db threads")?;
+
+        for (session_id, raw_title) in rows {
+            if let Some(title) = Self::title_from_text(&raw_title) {
+                titles.insert(session_id, title);
+            }
+        }
+
+        Ok(())
     }
 
     fn load_session_index_titles(path: &Path) -> HashMap<String, String> {
@@ -265,6 +353,9 @@ impl CodexConnector {
         }
 
         if let Some(session_id) = session_id {
+            if let Some(title) = title_sources.state_db.get(session_id) {
+                return (Some(title.clone()), "state_db");
+            }
             if let Some(title) = title_sources.session_index.get(session_id) {
                 return (Some(title.clone()), "session_index");
             }
@@ -947,10 +1038,16 @@ impl Connector for CodexConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
+    use frankensqlite::Connection;
     use serde_json::json;
     use std::fs;
+    use std::path::Path;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    fn open_test_connection(path: &Path) -> Connection {
+        Connection::open(path.to_string_lossy().as_ref()).unwrap()
+    }
 
     // =====================================================
     // Constructor Tests
@@ -1882,6 +1979,73 @@ not valid json at all
 
         assert_eq!(convs[0].title, Some("Indexed Thread Title".to_string()));
         assert_eq!(convs[0].messages[0].content, "<user_instructions>");
+        assert_eq!(convs[0].metadata["title_source"], "session_index");
+    }
+
+    #[test]
+    fn scan_uses_state_db_title_before_session_index_and_bootstrap_message() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            codex_dir.join("session_index.jsonl"),
+            r#"{"id":"session-state","thread_name":"Indexed Thread Title","updated_at":1}"#,
+        )
+        .unwrap();
+
+        let conn = open_test_connection(&codex_dir.join("state_5.sqlite"));
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+             INSERT INTO threads (id, title) VALUES ('session-state', 'State DB Thread Title');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let content = r#"{"type":"session_meta","payload":{"id":"session-state"}}
+{"type":"response_item","payload":{"role":"user","content":"<user_instructions>"}}
+{"type":"response_item","payload":{"role":"user","content":"Real prompt"}}
+"#;
+        fs::write(sessions.join("rollout-state-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, Some("State DB Thread Title".to_string()));
+        assert_eq!(convs[0].metadata["title_source"], "state_db");
+    }
+
+    #[test]
+    fn scan_skips_wrapper_state_db_title_and_falls_back() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            codex_dir.join("session_index.jsonl"),
+            r#"{"id":"session-wrapper-state","thread_name":"Indexed Fallback Title","updated_at":1}"#,
+        )
+        .unwrap();
+
+        let conn = open_test_connection(&codex_dir.join("state_5.sqlite"));
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+             INSERT INTO threads (id, title) VALUES ('session-wrapper-state', '<environment_context>');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let content = r#"{"type":"session_meta","payload":{"id":"session-wrapper-state"}}
+{"type":"response_item","payload":{"role":"user","content":"Real prompt"}}
+"#;
+        fs::write(sessions.join("rollout-wrapper-state-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title, Some("Indexed Fallback Title".to_string()));
         assert_eq!(convs[0].metadata["title_source"], "session_index");
     }
 

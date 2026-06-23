@@ -46,6 +46,7 @@ connectors = [
     "dep:dotenvy",
     "dep:bloomfilter",
     "dep:once_cell",
+    "dep:frankensqlite",
 ]
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
