@@ -34,6 +34,7 @@ base64 = { version = "0.22", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
 frankensqlite = { version = "0.1.2", package = "fsqlite", optional = true }
+rusqlite = { version = "0.37", optional = true }
 
 [features]
 default = []
@@ -46,7 +47,7 @@ connectors = [
     "dep:dotenvy",
     "dep:bloomfilter",
     "dep:once_cell",
-    "dep:frankensqlite",
+    "dep:rusqlite",
 ]
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]

@@ -3,8 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::params;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -200,24 +199,24 @@ impl CodexConnector {
     }
 
     fn merge_state_db_titles(path: &Path, titles: &mut HashMap<String, String>) -> Result<()> {
-        let conn = open_with_flags(
-            path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Codex state db: {}", path.display()))?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open Codex state db: {}", path.display()))?;
 
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
 
-        let rows: Vec<(String, String)> = conn
-            .query_map_collect(
-                "SELECT id, title FROM threads WHERE title IS NOT NULL AND title <> ''",
-                params![],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )
+        let mut stmt = conn
+            .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title <> ''")
             .with_context(|| "failed to query Codex state db threads")?;
 
-        for (session_id, raw_title) in rows {
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .with_context(|| "failed to read Codex state db thread rows")?;
+
+        for row in rows {
+            let (session_id, raw_title) = row.with_context(|| "failed to read Codex title row")?;
             if let Some(title) = Self::title_from_text(&raw_title) {
                 titles.insert(session_id, title);
             }
@@ -1038,7 +1037,7 @@ impl Connector for CodexConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
-    use frankensqlite::Connection;
+    use rusqlite::Connection;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
